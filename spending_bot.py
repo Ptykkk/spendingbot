@@ -1,12 +1,15 @@
 import os
 import re
 import sqlite3
+import threading
 from datetime import date, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN")
 DB = "spending.db"
+PORT = int(os.getenv("PORT", 10000))
 
 def init_db():
     conn = sqlite3.connect(DB)
@@ -133,6 +136,20 @@ def month_name(month_str):
     names = ["", "January", "February", "March", "April", "May", "June",
              "July", "August", "September", "October", "November", "December"]
     return f"{names[int(month)]} {year}"
+
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        return  # silence logs
+
+def run_dummy_server():
+    server = HTTPServer(("0.0.0.0", PORT), DummyHandler)
+    server.serve_forever()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -429,6 +446,9 @@ async def bills(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
+    # Start dummy server so Render detects a port
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("summary", summary))
