@@ -145,7 +145,7 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running")
 
     def log_message(self, format, *args):
-        return  # silence logs
+        return
 
 def run_dummy_server():
     server = HTTPServer(("0.0.0.0", PORT), DummyHandler)
@@ -446,7 +446,6 @@ async def bills(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    # Start dummy server so Render detects a port
     threading.Thread(target=run_dummy_server, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
