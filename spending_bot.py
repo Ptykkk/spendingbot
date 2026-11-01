@@ -1,15 +1,20 @@
 import os
 import re
 import sqlite3
-import threading
+import logging
 from datetime import date, datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import NetworkError, TimedOut
+
+# Enable basic logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
 DB = "spending.db"
-PORT = int(os.getenv("PORT", 10000))
 
 def init_db():
     conn = sqlite3.connect(DB)
@@ -137,22 +142,22 @@ def month_name(month_str):
              "July", "August", "September", "October", "November", "December"]
     return f"{names[int(month)]} {year}"
 
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
+async def safe_reply(update: Update, text: str):
+    """Reply with retry on network errors"""
+    for attempt in range(3):
+        try:
+            await update.message.reply_text(text)
+            return
+        except (NetworkError, TimedOut) as e:
+            logger.warning(f"Network error on attempt {attempt+1}: {e}")
+            if attempt == 2:
+                logger.error("Failed to send message after 3 attempts")
+            await asyncio.sleep(1)
 
-    def log_message(self, format, *args):
-        return
-
-def run_dummy_server():
-    server = HTTPServer(("0.0.0.0", PORT), DummyHandler)
-    server.serve_forever()
+import asyncio
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    text = (
         "Spending tracker ready!\n\n"
         "Log like this:\n"
         "• 45.80 lunch debit\n"
@@ -171,6 +176,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addbill ...\n"
         "/bills"
     )
+    await safe_reply(update, text)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -183,7 +189,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = safe_eval(parts[0])
     except:
-        await update.message.reply_text("Could not understand the amount. Examples:\n3.80+13.10 coffee debit\n25.50 lunch debit")
+        await safe_reply(update, "Could not understand the amount. Examples:\n3.80+13.10 coffee debit\n25.50 lunch debit")
         return
 
     method = "debit"
@@ -216,18 +222,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Debit: ${debit:,.2f}\n"
         f"Credit: ${credit:,.2f}"
     )
-    await update.message.reply_text(reply)
+    await safe_reply(update, reply)
 
 async def range_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Usage:\n/range 08/10/2026 10/11/2026\n/range 08/10/2026 10/11/2026 credit")
+        await safe_reply(update, "Usage:\n/range 08/10/2026 10/11/2026\n/range 08/10/2026 10/11/2026 credit")
         return
 
     start = parse_date(args[0])
     end = parse_date(args[1])
     if not start or not end:
-        await update.message.reply_text("Dates must be in DD/MM/YYYY format.")
+        await safe_reply(update, "Dates must be in DD/MM/YYYY format.")
         return
 
     method_filter = args[2].lower() if len(args) > 2 else None
@@ -246,18 +252,18 @@ async def range_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Debit: ${debit:,.2f}\n"
             f"Credit: ${credit:,.2f}"
         )
-    await update.message.reply_text(reply)
+    await safe_reply(update, reply)
 
 async def topay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: /topay 08/10/2026 10/11/2026")
+        await safe_reply(update, "Usage: /topay 08/10/2026 10/11/2026")
         return
 
     start = parse_date(args[0])
     end = parse_date(args[1])
     if not start or not end:
-        await update.message.reply_text("Dates must be in DD/MM/YYYY format.")
+        await safe_reply(update, "Dates must be in DD/MM/YYYY format.")
         return
 
     _, debit, credit, _ = get_range_data(start, end)
@@ -274,19 +280,20 @@ async def topay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"**Total still to pay: ${still_to_pay:,.2f}**\n\n"
         f"Debit already paid: ${debit:,.2f}"
     )
-    await update.message.reply_text(reply)
+    await safe_reply(update, reply)
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = get_today_total()
     total, debit, credit, _, month_str = get_month_data()
     mname = month_name(month_str)
-    await update.message.reply_text(
+    text = (
         f"📅 Today ({format_date(date.today().isoformat())}): ${today:,.2f}\n\n"
         f"📊 {mname}\n"
         f"Total: ${total:,.2f}\n"
         f"Debit: ${debit:,.2f}\n"
         f"Credit: ${credit:,.2f}"
     )
+    await safe_reply(update, text)
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB)
@@ -296,13 +303,12 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("No spends logged today.")
+        await safe_reply(update, "No spends logged today.")
         return
     lines = [f"{r[0]}. {r[1]} — ${r[2]:,.2f} ({r[3]})" for r in rows]
     total = sum(r[2] for r in rows)
-    await update.message.reply_text(
-        f"📅 Today ({format_date(today_iso)}) — Total: ${total:,.2f}\n\n" + "\n".join(lines)
-    )
+    text = f"📅 Today ({format_date(today_iso)}) — Total: ${total:,.2f}\n\n" + "\n".join(lines)
+    await safe_reply(update, text)
 
 async def month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month_str = context.args[0] if context.args else date.today().strftime("%Y-%m")
@@ -313,7 +319,7 @@ async def month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not rows:
-        await update.message.reply_text(f"No expenses found for {month_name(month_str)}.")
+        await safe_reply(update, f"No expenses found for {month_name(month_str)}.")
         return
 
     total, debit, credit, _, _ = get_month_data(month_str)
@@ -325,7 +331,7 @@ async def month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if len(rows) > 30:
         text += "\n\n… (showing latest 30)"
-    await update.message.reply_text(text)
+    await safe_reply(update, text)
 
 async def months(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB)
@@ -334,10 +340,10 @@ async def months(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("No data yet.")
+        await safe_reply(update, "No data yet.")
         return
     lines = [f"• {month_name(r[0])} → /month {r[0]}" for r in rows]
-    await update.message.reply_text("Available months:\n\n" + "\n".join(lines))
+    await safe_reply(update, "Available months:\n\n" + "\n".join(lines))
 
 async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB)
@@ -346,19 +352,19 @@ async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("No entries yet.")
+        await safe_reply(update, "No entries yet.")
         return
     lines = [f"{r[0]}. {format_date(r[4])}  ${r[2]:,.2f}  {r[1]} ({r[3]})" for r in rows]
-    await update.message.reply_text("Last 10 entries (use /delete <id>):\n\n" + "\n".join(lines))
+    await safe_reply(update, "Last 10 entries (use /delete <id>):\n\n" + "\n".join(lines))
 
 async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /delete 5")
+        await safe_reply(update, "Usage: /delete 5")
         return
     try:
         exp_id = int(context.args[0])
     except:
-        await update.message.reply_text("Please give a number, e.g. /delete 5")
+        await safe_reply(update, "Please give a number, e.g. /delete 5")
         return
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -367,14 +373,14 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     if deleted:
-        await update.message.reply_text(f"✅ Deleted entry #{exp_id}")
+        await safe_reply(update, f"✅ Deleted entry #{exp_id}")
     else:
-        await update.message.reply_text("Entry not found.")
+        await safe_reply(update, "Entry not found.")
 
 async def add_loan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 4:
-        await update.message.reply_text("Usage: /addloan DBS 13000 4.5 12")
+        await safe_reply(update, "Usage: /addloan DBS 13000 4.5 12")
         return
     name = args[0]
     principal = float(args[1])
@@ -391,13 +397,14 @@ async def add_loan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
+    text = (
         f"✅ Loan added: {name}\n"
         f"Principal: ${principal:,.2f}\n"
         f"Interest: {rate}%\n"
         f"Total to repay: ${total_repay:,.2f}\n"
         f"Monthly: ${monthly:,.2f} over {months} months"
     )
+    await safe_reply(update, text)
 
 async def loans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB)
@@ -406,7 +413,7 @@ async def loans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("No loans added. Use /addloan")
+        await safe_reply(update, "No loans added. Use /addloan")
         return
     lines = []
     for r in rows:
@@ -415,12 +422,12 @@ async def loans(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  Principal: ${r[1]:,.2f} | Interest: {r[2]}%\n"
             f"  Total repay: ${r[4]:,.2f} | Monthly: ${r[5]:,.2f} ({r[3]} months)"
         )
-    await update.message.reply_text("Loans:\n\n" + "\n\n".join(lines))
+    await safe_reply(update, "Loans:\n\n" + "\n\n".join(lines))
 
 async def add_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text("Usage: /addbill rent 1800 5")
+        await safe_reply(update, "Usage: /addbill rent 1800 5")
         return
     name, amount, due_day = args[0], float(args[1]), int(args[2])
     conn = sqlite3.connect(DB)
@@ -429,7 +436,7 @@ async def add_bill(update: Update, context: ContextTypes.DEFAULT_TYPE):
               (name, amount, due_day, "bill"))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"✅ Bill added: {name} ${amount:,.2f} due on the {due_day}th")
+    await safe_reply(update, f"✅ Bill added: {name} ${amount:,.2f} due on the {due_day}th")
 
 async def bills(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB)
@@ -438,16 +445,17 @@ async def bills(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        await update.message.reply_text("No bills added yet. Use /addbill")
+        await safe_reply(update, "No bills added yet. Use /addbill")
         return
     lines = [f"• {r[0]} — ${r[1]:,.2f} (due {r[2]}th)" for r in rows]
     total = sum(r[1] for r in rows)
-    await update.message.reply_text(f"📅 Upcoming bills (total ~${total:,.2f}/month):\n\n" + "\n".join(lines))
+    await safe_reply(update, f"📅 Upcoming bills (total ~${total:,.2f}/month):\n\n" + "\n".join(lines))
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception while handling an update:", exc_info=context.error)
 
 def main():
     init_db()
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("summary", summary))
@@ -463,6 +471,7 @@ def main():
     app.add_handler(CommandHandler("addbill", add_bill))
     app.add_handler(CommandHandler("bills", bills))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
     print("Bot is running...")
     app.run_polling()
 
